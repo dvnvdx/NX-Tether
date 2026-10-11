@@ -29,6 +29,20 @@ namespace ams::ubt {
                 u32 size;
                 u64 id;
                 u64 address;
+                s64 posted_us;
+            };
+
+            /* Recent transfer activity, kept in memory and written to the log when the client */
+            /* lets go of the adapter (which is also what happens when the client crashes).    */
+            static constexpr size_t TraceSize = 512;
+            struct TraceEntry {
+                u32 time_us;
+                char kind;
+                u8 ep;
+                u16 a;
+                u32 b;
+                u32 c;
+                u32 d;
             };
 
             struct Endpoint {
@@ -92,7 +106,14 @@ namespace ams::ubt {
             u32 m_logged_data_transfers = 0;
             u32 m_logged_ctrl_requests = 0;
             u32 m_tick_counter = 0;
+            u32 m_trace_next = 0;
+            u32 m_trace_total = 0;
+            TraceEntry m_trace[TraceSize] = {};
         public:
+            /* Called by the completion thread. Returns how long to wait before calling again */
+            /* (microseconds), or 0 when there is nothing left to do.                         */
+            s64 PumpBulkIn();
+
             /* Phone link side. */
             void Attach(const u8 *mac, const ::UsbHsInterface *phone_interface);
             void Detach();
@@ -142,10 +163,13 @@ namespace ams::ubt {
             void FlushPendingLocked(Endpoint &ep, Result result);
             void CloseEndpointLocked(Endpoint &ep);
             void ProcessBulkOutLocked(u64 address, u32 size);
-            void FillBulkInLocked();
+            s64  FillBulkInLocked();
+            void TraceLocked(char kind, u8 ep, u16 a, u32 b, u32 c, u32 d);
+            void DumpTraceLocked();
     };
 
     VirtualAdapter &GetVirtualAdapter();
+    void LaunchVirtualAdapterThread();
 
     /* IPC objects handed to the client. */
     class ClientEpSessionImpl {

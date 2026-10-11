@@ -1048,6 +1048,7 @@ namespace ams::ubt::link {
 
     void Launch() {
         util::ConstructAt(g_tx_event_storage, os::EventClearMode_AutoClear);
+        LaunchVirtualAdapterThread();
 
         R_ABORT_UNLESS(os::CreateThread(std::addressof(g_tx_thread), TxThreadFunction, nullptr, g_tx_thread_stack, sizeof(g_tx_thread_stack), 21));
         os::SetThreadNamePointer(std::addressof(g_tx_thread), "ubt::TxThread");

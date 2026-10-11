@@ -60,6 +60,49 @@ namespace ams::ubt {
         constinit u32 g_object_id_used = 0;
         constinit u32 g_object_id_next = 0;
 
+        s64 NowUs() {
+            return os::ConvertToTimeSpan(os::GetSystemTick()).GetMicroSeconds();
+        }
+
+        /* A bulk IN transfer is never completed sooner than this after it was posted. On real */
+        /* hardware a completion cannot arrive before the call that posted the transfer has    */
+        /* returned; the client is entitled to rely on that.                                   */
+        constexpr s64 MinUrbAgeUs = 150;
+
+        /* Thread that completes bulk IN transfers that could not be completed on the spot. */
+        constexpr size_t PumpThreadStackSize = 0x4000;
+        alignas(os::ThreadStackAlignment) constinit u8 g_pump_thread_stack[PumpThreadStackSize];
+        constinit os::ThreadType g_pump_thread;
+        constinit util::TypedStorage<os::Event> g_pump_event_storage = {};
+        constinit std::atomic<bool> g_pump_started = false;
+
+        void PumpThreadFunction(void *) {
+            while (true) {
+                util::GetReference(g_pump_event_storage).Wait();
+                while (true) {
+                    const s64 wait_us = GetVirtualAdapter().PumpBulkIn();
+                    if (wait_us <= 0) {
+                        break;
+                    }
+                    os::SleepThread(TimeSpan::FromMicroSeconds(wait_us));
+                }
+            }
+        }
+
+        void WakePump() {
+            if (g_pump_started.load()) {
+                util::GetReference(g_pump_event_storage).Signal();
+            }
+        }
+
+    }
+
+    void LaunchVirtualAdapterThread() {
+        util::ConstructAt(g_pump_event_storage, os::EventClearMode_AutoClear);
+        R_ABORT_UNLESS(os::CreateThread(std::addressof(g_pump_thread), PumpThreadFunction, nullptr, g_pump_thread_stack, sizeof(g_pump_thread_stack), 21));
+        os::SetThreadNamePointer(std::addressof(g_pump_thread), "ubt::PumpThread");
+        os::StartThread(std::addressof(g_pump_thread));
+        g_pump_started = true;
     }
 
     sf::cmif::DomainObjectId AllocateVirtualObjectId() {
@@ -334,6 +377,7 @@ namespace ams::ubt {
         m_acquired = false;
         m_backlog_count = 0;
         UBT_LOG_I("virt: interface released by client");
+        this->DumpTraceLocked();
     }
 
     /* ===================================================================================== */
@@ -668,6 +712,8 @@ namespace ams::ubt {
         report.transferredSize = transferred;
         report.id = id;
 
+        this->TraceLocked('C', static_cast<u8>(std::addressof(ep) - m_endpoints), static_cast<u16>(ep.pending_count), xfer_id, result.GetValue(), transferred);
+
         if (ep.ring_mapped && ep.ring != nullptr && ep.ring_capacity > 0) {
             ::UsbHsXferReport *ring_reports = reinterpret_cast<::UsbHsXferReport *>(ep.ring + 1);
             const u64 write_index = ep.ring->write_index;
@@ -714,6 +760,7 @@ namespace ams::ubt {
             --ep.report_count;
         }
         *out_count = count;
+        this->TraceLocked('R', static_cast<u8>(index), static_cast<u16>(count), max_count, ep.report_count, 0);
         R_SUCCEED();
     }
 
@@ -762,14 +809,52 @@ namespace ams::ubt {
         R_SUCCEED();
     }
 
-    void VirtualAdapter::FillBulkInLocked() {
+    void VirtualAdapter::TraceLocked(char kind, u8 ep, u16 a, u32 b, u32 c, u32 d) {
+        TraceEntry &e = m_trace[m_trace_next];
+        e.time_us = static_cast<u32>(NowUs());
+        e.kind = kind;
+        e.ep = ep;
+        e.a = a;
+        e.b = b;
+        e.c = c;
+        e.d = d;
+        m_trace_next = (m_trace_next + 1) % TraceSize;
+        ++m_trace_total;
+    }
+
+    void VirtualAdapter::DumpTraceLocked() {
+        const u32 count = std::min<u32>(m_trace_total, TraceSize);
+        UBT_LOG_I("trace: last %u of %u events. P=post(ep, urbs, xfer, size, addr) C=complete(ep, pending, xfer, result, bytes) R=reports(ep, given, asked) D=frame(len, backlog) X=drop", count, m_trace_total);
+        for (u32 i = 0; i < count; ++i) {
+            const TraceEntry &e = m_trace[(m_trace_next + TraceSize - count + i) % TraceSize];
+            UBT_LOG_I("trace: %10u %c ep%u %u %x %x %x", e.time_us, e.kind, e.ep, e.a, e.b, e.c, e.d);
+        }
+        m_trace_total = 0;
+        m_trace_next = 0;
+    }
+
+    s64 VirtualAdapter::PumpBulkIn() {
+        std::scoped_lock lk(m_lock);
+        if (!m_attached || !m_acquired) {
+            return 0;
+        }
+        return this->FillBulkInLocked();
+    }
+
+    s64 VirtualAdapter::FillBulkInLocked() {
         Endpoint &ep = m_endpoints[EndpointIndex_BulkIn];
         if (!ep.open) {
-            return;
+            return 0;
         }
 
         while (m_backlog_count > 0 && ep.pending_count > 0) {
             const PendingUrb urb = ep.pending[ep.pending_head];
+
+            /* Too fresh: the client may not even have seen the reply to its post yet. */
+            const s64 age_us = NowUs() - urb.posted_us;
+            if (age_us < MinUrbAgeUs) {
+                return MinUrbAgeUs - age_us;
+            }
             /* Never hand over more than the real chip would put into one transfer. */
             const bool single_frame = config::Get().rx_single_frame;
             const size_t capacity = std::min<size_t>(std::min<size_t>(urb.size, StagingSize), m_model.MaxBurstSize());
@@ -817,6 +902,7 @@ namespace ams::ubt {
 
             this->CompleteLocked(ep, urb.xfer_id, urb.id, result, urb.size, static_cast<u32>(used));
         }
+        return 0;
     }
 
     void VirtualAdapter::ProcessBulkOutLocked(u64 address, u32 size) {
@@ -849,9 +935,11 @@ namespace ams::ubt {
         const u32 xfer_id = ep.next_xfer_id++;
         *out_xfer_id = xfer_id;
 
+        const s64 now_us = NowUs();
         u64 urb_address = address;
         for (u32 i = 0; i < urb_count; ++i) {
             const u32 size = urb_sizes[i];
+            this->TraceLocked('P', static_cast<u8>(index), static_cast<u16>(urb_count), xfer_id, size, static_cast<u32>(urb_address));
 
             if (!m_attached) {
                 /* The adapter went away: fail the transfer through its report. */
@@ -867,14 +955,16 @@ namespace ams::ubt {
                 urb.size = size;
                 urb.id = id;
                 urb.address = urb_address;
+                urb.posted_us = now_us;
                 ++ep.pending_count;
             }
 
             urb_address += size;
         }
 
-        if (index == EndpointIndex_BulkIn && m_attached) {
-            this->FillBulkInLocked();
+        /* Waiting frames are handed over by the completion thread, after this call returned. */
+        if (index == EndpointIndex_BulkIn && m_attached && m_backlog_count > 0) {
+            WakePump();
         }
         R_SUCCEED();
     }
@@ -892,15 +982,19 @@ namespace ams::ubt {
         }
         if (m_backlog_count == BacklogSlots) {
             ++m_rx_dropped;
+            this->TraceLocked('X', EndpointIndex_BulkIn, static_cast<u16>(length), m_backlog_count, m_endpoints[EndpointIndex_BulkIn].pending_count, 0);
             return;
         }
+        this->TraceLocked('D', EndpointIndex_BulkIn, static_cast<u16>(length), m_backlog_count, m_endpoints[EndpointIndex_BulkIn].pending_count, 0);
 
         const u32 slot = (m_backlog_head + m_backlog_count) % BacklogSlots;
         std::memcpy(m_backlog[slot], frame, length);
         m_backlog_length[slot] = static_cast<u16>(length);
         ++m_backlog_count;
 
-        this->FillBulkInLocked();
+        if (this->FillBulkInLocked() > 0) {
+            WakePump();
+        }
     }
 
     void VirtualAdapter::Tick() {

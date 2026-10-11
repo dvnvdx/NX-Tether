@@ -8,8 +8,8 @@
 
 namespace ams::ubt {
 
-    constexpr inline u32 Version = 0x000103; /* 0.1.3 */
-    #define UBT_VERSION_STRING "0.1.3"
+    constexpr inline u32 Version = 0x000104; /* 0.1.4 */
+    #define UBT_VERSION_STRING "0.1.4"
 
     /* Operating modes (config.ini "mode="). */
     enum Mode : u8 {

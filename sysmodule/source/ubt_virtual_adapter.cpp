@@ -69,6 +69,9 @@ namespace ams::ubt {
         /* returned; the client is entitled to rely on that.                                   */
         constexpr s64 MinUrbAgeUs = 150;
 
+        /* How long a completion report may sit unread before the client is signaled again. */
+        constexpr s64 StalledReportUs = 3000;
+
         /* Thread that completes bulk IN transfers that could not be completed on the spot. */
         constexpr size_t PumpThreadStackSize = 0x4000;
         alignas(os::ThreadStackAlignment) constinit u8 g_pump_thread_stack[PumpThreadStackSize];
@@ -78,7 +81,8 @@ namespace ams::ubt {
 
         void PumpThreadFunction(void *) {
             while (true) {
-                util::GetReference(g_pump_event_storage).Wait();
+                util::GetReference(g_pump_event_storage).TimedWait(TimeSpan::FromMilliSeconds(2));
+                GetVirtualAdapter().KickStalledReports();
                 while (true) {
                     const s64 wait_us = GetVirtualAdapter().PumpBulkIn();
                     if (wait_us <= 0) {
@@ -366,6 +370,9 @@ namespace ams::ubt {
             return;
         }
 
+        UBT_LOG_I("virt: interface released by client");
+        this->DumpTraceLocked();
+
         for (auto &ep : m_endpoints) {
             this->CloseEndpointLocked(ep);
         }
@@ -376,8 +383,6 @@ namespace ams::ubt {
         }
         m_acquired = false;
         m_backlog_count = 0;
-        UBT_LOG_I("virt: interface released by client");
-        this->DumpTraceLocked();
     }
 
     /* ===================================================================================== */
@@ -655,6 +660,8 @@ namespace ams::ubt {
         ep.report_count = 0;
         ep.pending_head = 0;
         ep.pending_count = 0;
+        ep.seen_read_index = 0;
+        ep.seen_read_us = 0;
 
         std::memcpy(out_desc->data, desc, sizeof(out_desc->data));
         *out_index = index;
@@ -818,19 +825,69 @@ namespace ams::ubt {
         e.b = b;
         e.c = c;
         e.d = d;
+        e.ring_read = 0xFFFF;
+        e.ring_write = 0xFFFF;
+        if (ep < EndpointIndex_Count && m_endpoints[ep].ring_mapped && m_endpoints[ep].ring != nullptr) {
+            e.ring_read = static_cast<u16>(m_endpoints[ep].ring->read_index);
+            e.ring_write = static_cast<u16>(m_endpoints[ep].ring->write_index);
+        }
         m_trace_next = (m_trace_next + 1) % TraceSize;
         ++m_trace_total;
     }
 
     void VirtualAdapter::DumpTraceLocked() {
         const u32 count = std::min<u32>(m_trace_total, TraceSize);
-        UBT_LOG_I("trace: last %u of %u events. P=post(ep, urbs, xfer, size, addr) C=complete(ep, pending, xfer, result, bytes) R=reports(ep, given, asked) D=frame(len, backlog) X=drop", count, m_trace_total);
+        for (int i = 0; i < EndpointIndex_Count; ++i) {
+            const Endpoint &ep = m_endpoints[i];
+            UBT_LOG_I("trace: ep%d open=%d pending=%u next_xfer=%x ring read=%lld write=%lld capacity=%llu", i, ep.open, ep.pending_count, ep.next_xfer_id,
+                      (ep.ring_mapped && ep.ring != nullptr) ? static_cast<long long>(ep.ring->read_index) : -1ll,
+                      (ep.ring_mapped && ep.ring != nullptr) ? static_cast<long long>(ep.ring->write_index) : -1ll,
+                      static_cast<unsigned long long>(ep.ring_capacity));
+        }
+        UBT_LOG_I("trace: backlog=%u. last %u of %u events; columns: time_us kind ep a b c d [ring read/write before the event]", m_backlog_count, count, m_trace_total);
+        UBT_LOG_I("trace: P=post(urbs, xfer, size, addr) C=complete(pending, xfer, result, bytes) K=kick(unread, read idx) X=drop(len, backlog, pending)");
         for (u32 i = 0; i < count; ++i) {
             const TraceEntry &e = m_trace[(m_trace_next + TraceSize - count + i) % TraceSize];
-            UBT_LOG_I("trace: %10u %c ep%u %u %x %x %x", e.time_us, e.kind, e.ep, e.a, e.b, e.c, e.d);
+            UBT_LOG_I("trace: %10u %c ep%u %u %x %x %x [%x/%x]", e.time_us, e.kind, e.ep, e.a, e.b, e.c, e.d, e.ring_read, e.ring_write);
         }
         m_trace_total = 0;
         m_trace_next = 0;
+    }
+
+    void VirtualAdapter::KickStalledReports() {
+        std::scoped_lock lk(m_lock);
+        if (!m_attached || !m_acquired) {
+            return;
+        }
+
+        /* A completion is announced by signaling the endpoint's event. If the client was    */
+        /* busy with an earlier completion at that moment and resets the event afterwards,   */
+        /* the announcement is gone while the report is still waiting in the ring, and with  */
+        /* no transfer left outstanding nothing would ever announce it again.                */
+        const s64 now_us = NowUs();
+        for (int i = 0; i < EndpointIndex_Count; ++i) {
+            Endpoint &ep = m_endpoints[i];
+            if (!ep.open || !ep.event_created || !ep.ring_mapped || ep.ring == nullptr) {
+                continue;
+            }
+            const u64 read_index = ep.ring->read_index;
+            const u64 write_index = ep.ring->write_index;
+            if (read_index == write_index || read_index != ep.seen_read_index) {
+                ep.seen_read_index = read_index;
+                ep.seen_read_us = now_us;
+                continue;
+            }
+            if (now_us - ep.seen_read_us >= StalledReportUs) {
+                const u64 unread = (write_index + ep.ring_capacity - read_index) % std::max<u64>(ep.ring_capacity, 1);
+                this->TraceLocked('K', static_cast<u8>(i), static_cast<u16>(unread), static_cast<u32>(read_index), 0, 0);
+                if (m_logged_kicks < 20) {
+                    ++m_logged_kicks;
+                    UBT_LOG_I("virt: ep %d: client left %llu report(s) unread for %lld us; signaling again", i, static_cast<unsigned long long>(unread), static_cast<long long>(now_us - ep.seen_read_us));
+                }
+                os::SignalSystemEvent(std::addressof(ep.completion_event));
+                ep.seen_read_us = now_us;
+            }
+        }
     }
 
     s64 VirtualAdapter::PumpBulkIn() {
@@ -985,7 +1042,6 @@ namespace ams::ubt {
             this->TraceLocked('X', EndpointIndex_BulkIn, static_cast<u16>(length), m_backlog_count, m_endpoints[EndpointIndex_BulkIn].pending_count, 0);
             return;
         }
-        this->TraceLocked('D', EndpointIndex_BulkIn, static_cast<u16>(length), m_backlog_count, m_endpoints[EndpointIndex_BulkIn].pending_count, 0);
 
         const u32 slot = (m_backlog_head + m_backlog_count) % BacklogSlots;
         std::memcpy(m_backlog[slot], frame, length);

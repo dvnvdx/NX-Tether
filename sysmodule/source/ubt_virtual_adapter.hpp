@@ -34,7 +34,7 @@ namespace ams::ubt {
 
             /* Recent transfer activity, kept in memory and written to the log when the client */
             /* lets go of the adapter (which is also what happens when the client crashes).    */
-            static constexpr size_t TraceSize = 512;
+            static constexpr size_t TraceSize = 1024;
             struct TraceEntry {
                 u32 time_us;
                 char kind;
@@ -43,6 +43,8 @@ namespace ams::ubt {
                 u32 b;
                 u32 c;
                 u32 d;
+                u16 ring_read;   /* The endpoint's report ring as the client left it. */
+                u16 ring_write;
             };
 
             struct Endpoint {
@@ -62,6 +64,8 @@ namespace ams::ubt {
                 u32 report_count;
                 u32 pending_head;
                 u32 pending_count;
+                u64 seen_read_index;   /* Ring read position at the last check... */
+                s64 seen_read_us;      /* ...and when it was first seen there. */
                 ::UsbHsXferReport reports[ReportQueueSize];
                 PendingUrb pending[MaxPendingUrbs];
             };
@@ -106,6 +110,7 @@ namespace ams::ubt {
             u32 m_logged_data_transfers = 0;
             u32 m_logged_ctrl_requests = 0;
             u32 m_tick_counter = 0;
+            u32 m_logged_kicks = 0;
             u32 m_trace_next = 0;
             u32 m_trace_total = 0;
             TraceEntry m_trace[TraceSize] = {};
@@ -113,6 +118,9 @@ namespace ams::ubt {
             /* Called by the completion thread. Returns how long to wait before calling again */
             /* (microseconds), or 0 when there is nothing left to do.                         */
             s64 PumpBulkIn();
+
+            /* Wake the client again if it has left completion reports unread for a while. */
+            void KickStalledReports();
 
             /* Phone link side. */
             void Attach(const u8 *mac, const ::UsbHsInterface *phone_interface);

@@ -39,7 +39,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 #---------------------------------------------------------------------------------
 
 APP_TITLE	:=	USB Tether
-APP_VERSION	:=	0.1.3
+APP_VERSION	:=	0.1.4
 
 TARGET		:=	usb-tether
 BUILD		:=	build

@@ -5,7 +5,7 @@ USB tethering, and the console sees a wired LAN connection — no Wi-Fi hotspot 
 
 It consists of a system module (the bridge) and a Tesla/Ultrahand overlay (status and controls).
 
-> **Status: experimental (0.1.3).** The bridge has been confirmed working on one setup: a
+> **Status: experimental (0.1.4).** The bridge has been confirmed working on one setup: a
 > Switch (Mariko, "v2") on firmware 22.5.0 with Atmosphère 1.12.0 and a Samsung Galaxy S26
 > Ultra. Other consoles, firmware versions and phones are untested. Use it on emuMMC, and read
 > the [AI disclaimer](#ai-disclaimer) at the bottom.

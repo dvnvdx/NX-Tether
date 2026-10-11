@@ -69,8 +69,8 @@ namespace ams::ubt {
         /* returned; the client is entitled to rely on that.                                   */
         constexpr s64 MinUrbAgeUs = 150;
 
-        /* How long a completion report may sit unread before the client is signaled again. */
-        constexpr s64 StalledReportUs = 3000;
+        /* How long completion reports may sit unread before it is noted in the log. */
+        constexpr s64 StalledReportUs = 500000;
 
         /* Thread that completes bulk IN transfers that could not be completed on the spot. */
         constexpr size_t PumpThreadStackSize = 0x4000;
@@ -81,7 +81,7 @@ namespace ams::ubt {
 
         void PumpThreadFunction(void *) {
             while (true) {
-                util::GetReference(g_pump_event_storage).TimedWait(TimeSpan::FromMilliSeconds(2));
+                util::GetReference(g_pump_event_storage).TimedWait(TimeSpan::FromMilliSeconds(250));
                 GetVirtualAdapter().KickStalledReports();
                 while (true) {
                     const s64 wait_us = GetVirtualAdapter().PumpBulkIn();
@@ -807,7 +807,11 @@ namespace ams::ubt {
         }
 
         ep.ring = static_cast<::UsbHsRingHeader *>(address);
-        ep.ring_capacity = static_cast<u64>(ep.max_urb_count) * 0x21;
+        /* The client wraps its read position after 0x20 reports per URB plus one. This was   */
+        /* measured against the LAN driver on 22.5.0 (33 for one URB, 129 for four); using    */
+        /* 0x21 per URB makes the two sides disagree from the 130th report on, and the driver */
+        /* aborts.                                                                            */
+        ep.ring_capacity = static_cast<u64>(ep.max_urb_count) * 0x20 + 1;
         const u64 fits = size > sizeof(::UsbHsRingHeader) ? (size - sizeof(::UsbHsRingHeader)) / sizeof(::UsbHsXferReport) : 0;
         ep.ring_capacity = std::min(ep.ring_capacity, fits);
         ep.ring_mapped = true;
@@ -836,7 +840,8 @@ namespace ams::ubt {
     }
 
     void VirtualAdapter::DumpTraceLocked() {
-        const u32 count = std::min<u32>(m_trace_total, TraceSize);
+        /* Newest first and not too many: after a crash there is little time left to write. */
+        const u32 count = std::min<u32>(std::min<u32>(m_trace_total, TraceSize), 300);
         for (int i = 0; i < EndpointIndex_Count; ++i) {
             const Endpoint &ep = m_endpoints[i];
             UBT_LOG_I("trace: ep%d open=%d pending=%u next_xfer=%x ring read=%lld write=%lld capacity=%llu", i, ep.open, ep.pending_count, ep.next_xfer_id,
@@ -844,10 +849,10 @@ namespace ams::ubt {
                       (ep.ring_mapped && ep.ring != nullptr) ? static_cast<long long>(ep.ring->write_index) : -1ll,
                       static_cast<unsigned long long>(ep.ring_capacity));
         }
-        UBT_LOG_I("trace: backlog=%u. last %u of %u events; columns: time_us kind ep a b c d [ring read/write before the event]", m_backlog_count, count, m_trace_total);
-        UBT_LOG_I("trace: P=post(urbs, xfer, size, addr) C=complete(pending, xfer, result, bytes) K=kick(unread, read idx) X=drop(len, backlog, pending)");
+        UBT_LOG_I("trace: backlog=%u. last %u of %u events, newest first; columns: time_us kind ep a b c d [ring read/write before the event]", m_backlog_count, count, m_trace_total);
+        UBT_LOG_I("trace: P=post(urbs, xfer, size, addr) C=complete(pending, xfer, result, bytes) K=unread reports(count, read idx) X=drop(len, backlog, pending)");
         for (u32 i = 0; i < count; ++i) {
-            const TraceEntry &e = m_trace[(m_trace_next + TraceSize - count + i) % TraceSize];
+            const TraceEntry &e = m_trace[(m_trace_next + TraceSize - 1 - i) % TraceSize];
             UBT_LOG_I("trace: %10u %c ep%u %u %x %x %x [%x/%x]", e.time_us, e.kind, e.ep, e.a, e.b, e.c, e.d, e.ring_read, e.ring_write);
         }
         m_trace_total = 0;
@@ -860,10 +865,7 @@ namespace ams::ubt {
             return;
         }
 
-        /* A completion is announced by signaling the endpoint's event. If the client was    */
-        /* busy with an earlier completion at that moment and resets the event afterwards,   */
-        /* the announcement is gone while the report is still waiting in the ring, and with  */
-        /* no transfer left outstanding nothing would ever announce it again.                */
+        /* Diagnostic only: note when the client stops collecting its completion reports. */
         const s64 now_us = NowUs();
         for (int i = 0; i < EndpointIndex_Count; ++i) {
             Endpoint &ep = m_endpoints[i];
@@ -882,9 +884,9 @@ namespace ams::ubt {
                 this->TraceLocked('K', static_cast<u8>(i), static_cast<u16>(unread), static_cast<u32>(read_index), 0, 0);
                 if (m_logged_kicks < 20) {
                     ++m_logged_kicks;
-                    UBT_LOG_I("virt: ep %d: client left %llu report(s) unread for %lld us; signaling again", i, static_cast<unsigned long long>(unread), static_cast<long long>(now_us - ep.seen_read_us));
+                    UBT_LOG_I("virt: ep %d: client has left %llu report(s) unread for %lld ms (ring read=%llu write=%llu)", i, static_cast<unsigned long long>(unread), static_cast<long long>((now_us - ep.seen_read_us) / 1000),
+                              static_cast<unsigned long long>(read_index), static_cast<unsigned long long>(write_index));
                 }
-                os::SignalSystemEvent(std::addressof(ep.completion_event));
                 ep.seen_read_us = now_us;
             }
         }

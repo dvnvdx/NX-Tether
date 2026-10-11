@@ -119,7 +119,7 @@ namespace ams::ubt {
             /* (microseconds), or 0 when there is nothing left to do.                         */
             s64 PumpBulkIn();
 
-            /* Wake the client again if it has left completion reports unread for a while. */
+            /* Note in the log when the client has left completion reports unread for a while. */
             void KickStalledReports();
 
             /* Phone link side. */

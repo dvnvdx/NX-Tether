@@ -9,6 +9,7 @@ namespace ams::ubt::config {
         bool dhcp_probe;      /* Send one DHCP DISCOVER when the link comes up and nobody uses it. */
         u16  force_pid;       /* 0 = pick from eth's filters; otherwise emulate this ASIX product id. */
         bool prefer_ncm;      /* If the phone offers both, pick NCM over RNDIS. */
+        bool rx_single_frame; /* Give the LAN driver one frame per bulk IN transfer instead of packing several. */
     };
 
     void Load();

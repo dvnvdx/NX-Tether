@@ -13,6 +13,7 @@ namespace ams::ubt::config {
             .dhcp_probe = true,
             .force_pid  = 0,
             .prefer_ncm = false,
+            .rx_single_frame = false,
         };
 
         constinit char g_buffer[2048];
@@ -42,6 +43,8 @@ namespace ams::ubt::config {
                 g_config.force_pid = static_cast<u16>(ParseNumber(value));
             } else if (std::strcmp(key, "prefer_ncm") == 0) {
                 g_config.prefer_ncm = ParseNumber(value) != 0;
+            } else if (std::strcmp(key, "rx_single_frame") == 0) {
+                g_config.rx_single_frame = ParseNumber(value) != 0;
             }
         }
 
@@ -99,8 +102,12 @@ namespace ams::ubt::config {
                 "force_pid=0x%04x\n"
                 "\n"
                 "; prefer_ncm: when the phone offers both RNDIS and NCM, use NCM.\n"
-                "prefer_ncm=%d\n",
-                g_config.mode, g_config.log_level, g_config.dhcp_probe ? 1 : 0, g_config.force_pid, g_config.prefer_ncm ? 1 : 0);
+                "prefer_ncm=%d\n"
+                "\n"
+                "; rx_single_frame: hand the console one ethernet frame per USB transfer instead of\n"
+                "; packing several. Slower; for diagnosing crashes under heavy traffic.\n"
+                "rx_single_frame=%d\n",
+                g_config.mode, g_config.log_level, g_config.dhcp_probe ? 1 : 0, g_config.force_pid, g_config.prefer_ncm ? 1 : 0, g_config.rx_single_frame ? 1 : 0);
             R_UNLESS(len > 0, fs::ResultInvalidArgument());
 
             R_DISCARD(fs::DeleteFile(ConfigPath));

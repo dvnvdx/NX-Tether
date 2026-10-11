@@ -252,6 +252,12 @@ static void TestAsixReceiveFraming() {
         for (std::size_t j = sent[i].size(); j < received[i].size(); ++j) { CHECK(received[i][j] == 0); }
     }
 
+    /* Burst size follows RX control bits 8-9 on the plain AX88772. */
+    CHECK(model.MaxBurstSize() == 2048);
+    model.rx_ctl = 0x0388;
+    CHECK(model.MaxBurstSize() == 16384);
+    model.rx_ctl = 0x0088;
+
     /* Does not fit: must report 0 and leave the caller to try the next buffer. */
     std::uint8_t small[64];
     const Bytes big = MakeFrame(100);

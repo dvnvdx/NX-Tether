@@ -770,7 +770,9 @@ namespace ams::ubt {
 
         while (m_backlog_count > 0 && ep.pending_count > 0) {
             const PendingUrb urb = ep.pending[ep.pending_head];
-            const size_t capacity = std::min<size_t>(urb.size, StagingSize);
+            /* Never hand over more than the real chip would put into one transfer. */
+            const bool single_frame = config::Get().rx_single_frame;
+            const size_t capacity = std::min<size_t>(std::min<size_t>(urb.size, StagingSize), m_model.MaxBurstSize());
 
             /* Pack as many queued frames as fit into this transfer. */
             size_t used = 0;
@@ -784,6 +786,9 @@ namespace ams::ubt {
                 ++frames;
                 m_backlog_head = (m_backlog_head + 1) % BacklogSlots;
                 --m_backlog_count;
+                if (single_frame) {
+                    break;
+                }
             }
 
             if (frames == 0) {

@@ -152,6 +152,16 @@ namespace ubtcore::asix {
                 return (rx_ctl & RxCtlStartOperation) != 0;
             }
 
+            /* Largest bulk IN transfer the chip produces. On the AX88772/772A the driver picks */
+            /* it through RX control bits 8-9 (2048 << n); the AX88772B uses those bits for the */
+            /* header format and bursts 2048 bytes. Drivers may size their parsing for this.    */
+            std::size_t MaxBurstSize() const {
+                if (IsChecksumCapableProduct(pid)) {
+                    return 2048;
+                }
+                return static_cast<std::size_t>(2048) << ((rx_ctl >> 8) & 3);
+            }
+
             bool UsesChecksumHeader() const {
                 return IsChecksumCapableProduct(pid) && (rx_ctl & RxCtlHeaderType1) != 0;
             }

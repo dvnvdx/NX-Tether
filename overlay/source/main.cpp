@@ -186,7 +186,7 @@ class StatusGui : public tsl::Gui {
         bool m_toggle_synced = false;
     public:
         virtual tsl::elm::Element *createUI() override {
-            auto *frame = new tsl::elm::OverlayFrame("USB Tether", "v0.1.1");
+            auto *frame = new tsl::elm::OverlayFrame("USB Tether", "v0.1.2");
             auto *list = new tsl::elm::List();
 
             m_message = new tsl::elm::ListItem("Module", "...");

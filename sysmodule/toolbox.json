@@ -1,0 +1,5 @@
+{
+    "name": "usb-tether",
+    "tid": "4200000000000E7B",
+    "requires_reboot": true
+}

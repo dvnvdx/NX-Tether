@@ -1,0 +1,37 @@
+# Build output
+build/
+out/
+dist/
+*.elf
+*.nso
+*.nsp
+*.npdm
+*.nacp
+*.nro
+*.ovl
+*.map
+*.lst
+*.o
+*.d
+*.a
+
+# Release archives
+*.zip
+
+# PC-side test binary
+tests/test_core
+
+# Files copied back from the console for debugging
+log.txt
+log.old.txt
+config.ini
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+compile_commands.json
+.cache/

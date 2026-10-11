@@ -901,6 +901,19 @@ namespace ams::ubt {
     }
 
     s64 VirtualAdapter::FillBulkInLocked() {
+        const s64 wait_us = this->FillBulkInOnceLocked();
+
+        /* Bookkeeping for the throughput diagnostics. */
+        const s64 now_us = NowUs();
+        const bool blocked = m_backlog_count > 0 && m_endpoints[EndpointIndex_BulkIn].pending_count == 0;
+        if (m_blocked_since_us != 0) {
+            m_stat_blocked_us += now_us - m_blocked_since_us;
+        }
+        m_blocked_since_us = blocked ? now_us : 0;
+        return wait_us;
+    }
+
+    s64 VirtualAdapter::FillBulkInOnceLocked() {
         Endpoint &ep = m_endpoints[EndpointIndex_BulkIn];
         if (!ep.open) {
             return 0;
@@ -946,6 +959,8 @@ namespace ams::ubt {
 
             ep.pending_head = (ep.pending_head + 1) % MaxPendingUrbs;
             --ep.pending_count;
+            ++m_stat_completions;
+            m_stat_frames += frames;
 
             Result result = GetClientMemory().Write(urb.address, m_staging, used);
             if (R_FAILED(result)) {
@@ -1041,6 +1056,7 @@ namespace ams::ubt {
         }
         if (m_backlog_count == BacklogSlots) {
             ++m_rx_dropped;
+            ++m_stat_drops;
             this->TraceLocked('X', EndpointIndex_BulkIn, static_cast<u16>(length), m_backlog_count, m_endpoints[EndpointIndex_BulkIn].pending_count, 0);
             return;
         }
@@ -1049,6 +1065,7 @@ namespace ams::ubt {
         std::memcpy(m_backlog[slot], frame, length);
         m_backlog_length[slot] = static_cast<u16>(length);
         ++m_backlog_count;
+        m_stat_backlog_max = std::max(m_stat_backlog_max, m_backlog_count);
     }
 
     void VirtualAdapter::FlushFrames() {
@@ -1083,6 +1100,22 @@ namespace ams::ubt {
             this->CompleteLocked(ep, urb.xfer_id, urb.id, result, urb.size, R_SUCCEEDED(result) ? size : 0);
         }
         ++m_tick_counter;
+    }
+
+    VirtualAdapter::Stats VirtualAdapter::TakeStats() {
+        std::scoped_lock lk(m_lock);
+        const s64 now_us = NowUs();
+        if (m_blocked_since_us != 0) {
+            m_stat_blocked_us += now_us - m_blocked_since_us;
+            m_blocked_since_us = now_us;
+        }
+        const Stats stats = { m_stat_completions, m_stat_frames, m_stat_backlog_max, m_stat_drops, m_stat_blocked_us };
+        m_stat_completions = 0;
+        m_stat_frames = 0;
+        m_stat_backlog_max = 0;
+        m_stat_drops = 0;
+        m_stat_blocked_us = 0;
+        return stats;
     }
 
     void VirtualAdapter::FillStatus(Status *status) {

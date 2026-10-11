@@ -18,7 +18,8 @@ namespace ams::ubt::link {
         constexpr size_t CtrlBufferSize = 0x1000;
         constexpr size_t RxBufferSize   = 0x8000;
         constexpr size_t MaxRxUrbs      = 4;
-        constexpr size_t TxBufferSize   = 0x1000;
+        constexpr size_t TxBufferSize   = 0x4000;
+        constexpr u32    MaxTxAggregate = 10;
         constexpr size_t TxQueueSlots   = 128;
         constexpr size_t MaxInterfaces  = 24;
 
@@ -82,6 +83,7 @@ namespace ams::ubt::link {
 
             u32 rndis_request_id;
             u32 rndis_max_transfer;
+            u32 rndis_max_packets;
 
             u32 ncm_out_max_size;
             u16 ncm_out_divisor;
@@ -140,10 +142,27 @@ namespace ams::ubt::link {
         /* Bus logging. */
         constinit u64 g_last_bus_signature = 0;
         constinit u32 g_logged_rx_parse_errors = 0;
+
+        /* Throughput diagnostics, reset whenever they are logged. */
+        constinit std::atomic<u32> g_stat_rx_transfers = 0;
+        constinit std::atomic<u64> g_stat_rx_bytes = 0;
+        constinit std::atomic<u32> g_stat_rx_frames = 0;
+        constinit std::atomic<s64> g_stat_rx_idle_us = 0;    /* Link thread waiting for the phone. */
+        constinit std::atomic<u32> g_stat_tx_transfers = 0;
+        constinit std::atomic<u32> g_stat_tx_frames = 0;
+        constinit std::atomic<u64> g_stat_tx_bytes = 0;
+        constinit std::atomic<s64> g_stat_tx_busy_us = 0;    /* Transmit thread inside USB transfers. */
+        constinit std::atomic<u32> g_stat_tx_queue_max = 0;
+        constinit std::atomic<u32> g_stat_tx_drops = 0;
+        constinit s64 g_stat_last_ms = 0;
         constinit bool g_bus_query_failure_logged = false;
 
         os::Event &GetTxEvent() {
             return util::GetReference(g_tx_event_storage);
+        }
+
+        s64 NowUs() {
+            return os::ConvertToTimeSpan(os::GetSystemTick()).GetMicroSeconds();
         }
 
         s64 NowMs() {
@@ -370,6 +389,7 @@ namespace ams::ubt::link {
                 R_UNLESS(response_length >= 44, ResultLinkBadData);
 
                 ctx.rndis_max_transfer = ReadLe32(response + 36);
+                ctx.rndis_max_packets = ReadLe32(response + 32);
                 UBT_LOG_I("link: RNDIS initialized: version %u.%u, medium %u, max packets/transfer %u, max transfer %u, alignment 2^%u",
                           ReadLe32(response + 16), ReadLe32(response + 20), ReadLe32(response + 28), ReadLe32(response + 32), ctx.rndis_max_transfer, ReadLe32(response + 40));
             }
@@ -523,6 +543,8 @@ namespace ams::ubt::link {
             }
             g_rx_packets.fetch_add(1);
             g_rx_bytes.fetch_add(length);
+            g_stat_rx_frames.fetch_add(1);
+            g_stat_rx_bytes.fetch_add(length);
 
             if (log::GetLevel() >= log::Level_Trace) {
                 log::Hex(log::Level_Trace, "link: rx frame", frame, length, 48);
@@ -838,8 +860,43 @@ namespace ams::ubt::link {
         }
 
         /* Things that have to happen regularly while the link is up. */
+        /* While data is flowing, describe every few seconds where the time goes. */
+        void LogThroughput() {
+            const s64 now_ms = NowMs();
+            const s64 elapsed_ms = now_ms - g_stat_last_ms;
+            if (elapsed_ms < 5000) {
+                return;
+            }
+            g_stat_last_ms = now_ms;
+
+            const u64 rx_bytes = g_stat_rx_bytes.exchange(0);
+            const u32 rx_transfers = g_stat_rx_transfers.exchange(0);
+            const u32 rx_frames = g_stat_rx_frames.exchange(0);
+            const s64 rx_idle_us = g_stat_rx_idle_us.exchange(0);
+            const u64 tx_bytes = g_stat_tx_bytes.exchange(0);
+            const u32 tx_transfers = g_stat_tx_transfers.exchange(0);
+            const u32 tx_frames = g_stat_tx_frames.exchange(0);
+            const s64 tx_busy_us = g_stat_tx_busy_us.exchange(0);
+            const u32 tx_queue_max = g_stat_tx_queue_max.exchange(0);
+            const u32 tx_drops = g_stat_tx_drops.exchange(0);
+            const auto virt = GetVirtualAdapter().TakeStats();
+
+            if (elapsed_ms > 60000 || rx_bytes + tx_bytes < 1_MB || log::GetLevel() < log::Level_Debug) {
+                return;
+            }
+
+            const s64 elapsed_us = elapsed_ms * 1000;
+            UBT_LOG_D("stats: %lld ms. rx %llu KB/s in %u transfers (%u frames), link thread idle %lld%%. to console: %u transfers, backlog max %u, waiting for console %lld%%, dropped %u. tx %llu KB/s, %u frames in %u transfers, avg %lld us each, tx thread busy %lld%%, queue max %u, dropped %u",
+                      static_cast<long long>(elapsed_ms),
+                      static_cast<unsigned long long>(rx_bytes / 1024 * 1000 / elapsed_ms), rx_transfers, rx_frames, static_cast<long long>(rx_idle_us * 100 / elapsed_us),
+                      virt.completions, virt.backlog_max, static_cast<long long>(virt.blocked_us * 100 / elapsed_us), virt.drops,
+                      static_cast<unsigned long long>(tx_bytes / 1024 * 1000 / elapsed_ms), tx_frames, tx_transfers, static_cast<long long>(tx_transfers != 0 ? tx_busy_us / tx_transfers : 0),
+                      static_cast<long long>(tx_busy_us * 100 / elapsed_us), tx_queue_max, tx_drops);
+        }
+
         void RunPeriodicTasks(LinkContext &ctx) {
             auto &adapter = GetVirtualAdapter();
+            LogThroughput();
 
             /* Present or withdraw the virtual adapter according to the mode and the overlay toggle. */
             const bool want_adapter = config::Get().mode == Mode_Bridge && g_bridge_enabled.load();
@@ -898,7 +955,10 @@ namespace ams::ubt::link {
             while (!stop) {
                 /* Wait for data, waking up regularly for housekeeping. */
                 while (true) {
-                    if (R_SUCCEEDED(eventWait(std::addressof(ctx.ep_in.eventXfer), 200 * MsToNs))) {
+                    const s64 wait_start_us = NowUs();
+                    const bool got = R_SUCCEEDED(eventWait(std::addressof(ctx.ep_in.eventXfer), 200 * MsToNs));
+                    g_stat_rx_idle_us.fetch_add(NowUs() - wait_start_us);
+                    if (got) {
                         break;
                     }
                     if (g_relink_requested.exchange(false)) { reason = "relink requested"; stop = true; break; }
@@ -945,6 +1005,7 @@ namespace ams::ubt::link {
                         os::SleepThread(TimeSpan::FromMilliSeconds(20));
                     } else {
                         consecutive_errors = 0;
+                        g_stat_rx_transfers.fetch_add(1);
                         ProcessReceivedTransfer(ctx, g_rx_buffers[index], std::min<size_t>(report.transferredSize, RxBufferSize));
                     }
 
@@ -1047,6 +1108,50 @@ namespace ams::ubt::link {
             return true;
         }
 
+        /* Length of the next queued frame, or 0 if the queue is empty. */
+        size_t PeekTransmitLength() {
+            std::scoped_lock lk(g_tx_lock);
+            return g_tx_count != 0 ? g_tx_length[g_tx_head] : 0;
+        }
+
+        /* RNDIS lets one transfer carry several packet messages. Append queued frames to the */
+        /* message already in g_tx_buffer (total bytes, no boundary padding yet).             */
+        size_t AppendRndisPackets(LinkContext &ctx, size_t total, u32 *inout_frames, u64 *inout_bytes) {
+            const u32 max_frames = std::min<u32>(ctx.rndis_max_packets, MaxTxAggregate);
+            const size_t limit = std::min<size_t>(TxBufferSize, ctx.rndis_max_transfer != 0 ? ctx.rndis_max_transfer : TxBufferSize) - 1;
+            size_t last_message = 0;
+
+            while (*inout_frames < max_frames) {
+                const size_t next_length = PeekTransmitLength();
+                const size_t padded = util::AlignUp(total, 16);
+                if (next_length == 0 || padded + framing::RndisPacketHeaderSize + next_length > limit) {
+                    break;
+                }
+
+                /* Messages that are followed by another one are padded to the alignment the */
+                /* phone asked for, and the padding counts as part of the message.           */
+                std::memset(g_tx_buffer + total, 0, padded - total);
+                WriteLe32(g_tx_buffer + last_message + 4, static_cast<u32>(padded - last_message));
+
+                size_t length = 0;
+                if (!DequeueTransmit(std::addressof(length))) {
+                    WriteLe32(g_tx_buffer + last_message + 4, static_cast<u32>(total - last_message));
+                    break;
+                }
+                const size_t added = framing::BuildRndisPacket(g_tx_buffer + padded, TxBufferSize - padded, g_tx_frame, length, 0);
+                if (added == 0) {
+                    WriteLe32(g_tx_buffer + last_message + 4, static_cast<u32>(total - last_message));
+                    g_tx_dropped.fetch_add(1);
+                    break;
+                }
+                last_message = padded;
+                total = padded + added;
+                ++*inout_frames;
+                *inout_bytes += length;
+            }
+            return total;
+        }
+
         void TxThreadFunction(void *) {
             s64 last_tick_ms = 0;
             u32 logged_errors = 0;
@@ -1066,14 +1171,33 @@ namespace ams::ubt::link {
                         log::Hex(log::Level_Trace, "link: tx frame", g_tx_frame, length, 48);
                     }
 
-                    const size_t total = BuildTransmitBuffer(g_ctx, g_tx_frame, length);
+                    u32 frames = 1;
+                    u64 bytes = length;
+                    size_t total = 0;
+                    if (g_ctx.protocol == LinkProtocol_Rndis && config::Get().tx_aggregate && g_ctx.rndis_max_packets > 1) {
+                        const size_t max_packet = g_ctx.out_max_packet != 0 ? g_ctx.out_max_packet : 512;
+                        total = framing::BuildRndisPacket(g_tx_buffer, TxBufferSize, g_tx_frame, length, 0);
+                        if (total != 0) {
+                            total = AppendRndisPackets(g_ctx, total, std::addressof(frames), std::addressof(bytes));
+                            if ((total % max_packet) == 0) {
+                                g_tx_buffer[total++] = 0;
+                            }
+                        }
+                    } else {
+                        total = BuildTransmitBuffer(g_ctx, g_tx_frame, length);
+                    }
                     if (total == 0) {
                         g_tx_dropped.fetch_add(1);
                         continue;
                     }
 
                     u32 transferred = 0;
+                    const s64 start_us = NowUs();
                     const Result rc = EndpointTransfer(std::addressof(g_ctx.ep_out), g_tx_buffer, static_cast<u32>(total), std::addressof(transferred), 1000);
+                    g_stat_tx_busy_us.fetch_add(NowUs() - start_us);
+                    g_stat_tx_transfers.fetch_add(1);
+                    g_stat_tx_frames.fetch_add(frames);
+                    g_stat_tx_bytes.fetch_add(bytes);
                     if (R_FAILED(rc)) {
                         g_tx_dropped.fetch_add(1);
                         SetLastError(rc);
@@ -1084,8 +1208,8 @@ namespace ams::ubt::link {
                         /* A timed out transfer is still pending; the link has to be rebuilt. */
                         g_link_failed = true;
                     } else {
-                        g_tx_packets.fetch_add(1);
-                        g_tx_bytes.fetch_add(length);
+                        g_tx_packets.fetch_add(frames);
+                        g_tx_bytes.fetch_add(bytes);
                     }
                 }
 
@@ -1123,7 +1247,11 @@ namespace ams::ubt::link {
             std::scoped_lock lk(g_tx_lock);
             if (g_tx_count == TxQueueSlots) {
                 g_tx_dropped.fetch_add(1);
+                g_stat_tx_drops.fetch_add(1);
                 return false;
+            }
+            if (g_tx_count + 1 > g_stat_tx_queue_max.load()) {
+                g_stat_tx_queue_max = g_tx_count + 1;
             }
             const u32 slot = (g_tx_head + g_tx_count) % TxQueueSlots;
             std::memcpy(g_tx_queue[slot], frame, length);

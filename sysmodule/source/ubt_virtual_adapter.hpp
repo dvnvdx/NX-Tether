@@ -111,6 +111,14 @@ namespace ams::ubt {
             u32 m_logged_ctrl_requests = 0;
             u32 m_tick_counter = 0;
             u32 m_logged_kicks = 0;
+
+            /* Throughput diagnostics, reset whenever they are read. */
+            u32 m_stat_completions = 0;
+            u32 m_stat_frames = 0;
+            u32 m_stat_backlog_max = 0;
+            u32 m_stat_drops = 0;
+            s64 m_stat_blocked_us = 0;   /* Time frames were waiting with no transfer from the client to put them in. */
+            s64 m_blocked_since_us = 0;
             u32 m_trace_next = 0;
             u32 m_trace_total = 0;
             TraceEntry m_trace[TraceSize] = {};
@@ -156,6 +164,15 @@ namespace ams::ubt {
             Result CreateSmmuSpace(u32 generation, int index, u64 address, u32 size);
             Result ShareReportRing(u32 generation, int index, os::NativeHandle tmem, u32 size);
 
+            struct Stats {
+                u32 completions;
+                u32 frames;
+                u32 backlog_max;
+                u32 drops;
+                s64 blocked_us;
+            };
+            Stats TakeStats();
+
             /* Status. */
             void FillStatus(Status *status);
         private:
@@ -173,6 +190,7 @@ namespace ams::ubt {
             void CloseEndpointLocked(Endpoint &ep);
             void ProcessBulkOutLocked(u64 address, u32 size);
             s64  FillBulkInLocked();
+            s64  FillBulkInOnceLocked();
             void TraceLocked(char kind, u8 ep, u16 a, u32 b, u32 c, u32 d);
             void DumpTraceLocked();
     };

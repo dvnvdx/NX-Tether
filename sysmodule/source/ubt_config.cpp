@@ -14,6 +14,7 @@ namespace ams::ubt::config {
             .force_pid  = 0,
             .prefer_ncm = false,
             .rx_urbs = 4,
+            .tx_aggregate = true,
             .rx_single_frame = false,
         };
 
@@ -49,6 +50,8 @@ namespace ams::ubt::config {
                 if (v >= 1 && v <= 4) {
                     g_config.rx_urbs = static_cast<u8>(v);
                 }
+            } else if (std::strcmp(key, "tx_aggregate") == 0) {
+                g_config.tx_aggregate = ParseNumber(value) != 0;
             } else if (std::strcmp(key, "rx_single_frame") == 0) {
                 g_config.rx_single_frame = ParseNumber(value) != 0;
             }
@@ -116,8 +119,12 @@ namespace ams::ubt::config {
                 "\n"
                 "; rx_urbs: receive transfers kept queued with the phone, 1 to 4. More is faster.\n"
                 "; Set to 1 if the link to the phone does not come up or keeps dropping.\n"
-                "rx_urbs=%d\n",
-                g_config.mode, g_config.log_level, g_config.dhcp_probe ? 1 : 0, g_config.force_pid, g_config.prefer_ncm ? 1 : 0, g_config.rx_single_frame ? 1 : 0, g_config.rx_urbs);
+                "rx_urbs=%d\n"
+                "\n"
+                "; tx_aggregate: with RNDIS, send several waiting frames to the phone in one transfer.\n"
+                "; Set to 0 if uploads or connections fail.\n"
+                "tx_aggregate=%d\n",
+                g_config.mode, g_config.log_level, g_config.dhcp_probe ? 1 : 0, g_config.force_pid, g_config.prefer_ncm ? 1 : 0, g_config.rx_single_frame ? 1 : 0, g_config.rx_urbs, g_config.tx_aggregate ? 1 : 0);
             R_UNLESS(len > 0, fs::ResultInvalidArgument());
 
             R_DISCARD(fs::DeleteFile(ConfigPath));

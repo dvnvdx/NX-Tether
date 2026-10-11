@@ -1049,7 +1049,13 @@ namespace ams::ubt {
         std::memcpy(m_backlog[slot], frame, length);
         m_backlog_length[slot] = static_cast<u16>(length);
         ++m_backlog_count;
+    }
 
+    void VirtualAdapter::FlushFrames() {
+        std::scoped_lock lk(m_lock);
+        if (!m_attached || !m_acquired || m_backlog_count == 0) {
+            return;
+        }
         if (this->FillBulkInLocked() > 0) {
             WakePump();
         }

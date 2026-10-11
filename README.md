@@ -5,7 +5,7 @@ USB tethering, and the console sees a wired LAN connection — no Wi-Fi hotspot 
 
 It consists of a system module (the bridge) and a Tesla/Ultrahand overlay (status and controls).
 
-> **Status: experimental (0.1.5).** The bridge has been confirmed working on one setup: a
+> **Status: experimental (0.1.6).** The bridge has been confirmed working on one setup: a
 > Switch (Mariko, "v2") on firmware 22.5.0 with Atmosphère 1.12.0 and a Samsung Galaxy S26
 > Ultra. Other consoles, firmware versions and phones are untested. Use it on emuMMC, and read
 > the [AI disclaimer](#ai-disclaimer) at the bottom.
@@ -128,6 +128,7 @@ Controls:
 | `dhcp_probe` | `1` | Send one DHCP request when the phone link comes up and the system is not using it, to prove that data flows. |
 | `force_pid` | `0x0000` | USB product ID of the ASIX adapter to imitate, e.g. `0x7720`. `0` chooses automatically from what the system asks for. |
 | `prefer_ncm` | `0` | When the phone offers both RNDIS and NCM, use NCM. |
+| `rx_urbs` | `4` | Receive transfers kept queued with the phone, 1 to 4. More is faster; set to 1 if the link to the phone does not come up or keeps dropping. |
 | `rx_single_frame` | `0` | Hand the console one ethernet frame per USB transfer instead of packing several. Slower; for diagnosing crashes under heavy traffic. |
 
 Changes take effect after a reboot. The generated file documents each key as well.

@@ -13,6 +13,7 @@ namespace ams::ubt::config {
             .dhcp_probe = true,
             .force_pid  = 0,
             .prefer_ncm = false,
+            .rx_urbs = 4,
             .rx_single_frame = false,
         };
 
@@ -43,6 +44,11 @@ namespace ams::ubt::config {
                 g_config.force_pid = static_cast<u16>(ParseNumber(value));
             } else if (std::strcmp(key, "prefer_ncm") == 0) {
                 g_config.prefer_ncm = ParseNumber(value) != 0;
+            } else if (std::strcmp(key, "rx_urbs") == 0) {
+                const long v = ParseNumber(value);
+                if (v >= 1 && v <= 4) {
+                    g_config.rx_urbs = static_cast<u8>(v);
+                }
             } else if (std::strcmp(key, "rx_single_frame") == 0) {
                 g_config.rx_single_frame = ParseNumber(value) != 0;
             }
@@ -106,8 +112,12 @@ namespace ams::ubt::config {
                 "\n"
                 "; rx_single_frame: hand the console one ethernet frame per USB transfer instead of\n"
                 "; packing several. Slower; for diagnosing crashes under heavy traffic.\n"
-                "rx_single_frame=%d\n",
-                g_config.mode, g_config.log_level, g_config.dhcp_probe ? 1 : 0, g_config.force_pid, g_config.prefer_ncm ? 1 : 0, g_config.rx_single_frame ? 1 : 0);
+                "rx_single_frame=%d\n"
+                "\n"
+                "; rx_urbs: receive transfers kept queued with the phone, 1 to 4. More is faster.\n"
+                "; Set to 1 if the link to the phone does not come up or keeps dropping.\n"
+                "rx_urbs=%d\n",
+                g_config.mode, g_config.log_level, g_config.dhcp_probe ? 1 : 0, g_config.force_pid, g_config.prefer_ncm ? 1 : 0, g_config.rx_single_frame ? 1 : 0, g_config.rx_urbs);
             R_UNLESS(len > 0, fs::ResultInvalidArgument());
 
             R_DISCARD(fs::DeleteFile(ConfigPath));

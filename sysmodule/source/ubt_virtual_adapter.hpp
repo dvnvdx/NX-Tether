@@ -125,7 +125,8 @@ namespace ams::ubt {
             /* Phone link side. */
             void Attach(const u8 *mac, const ::UsbHsInterface *phone_interface);
             void Detach();
-            void DeliverFrame(const u8 *frame, size_t length);
+            void DeliverFrame(const u8 *frame, size_t length); /* Queues; FlushFrames() hands over. */
+            void FlushFrames();
             void Tick();
 
             /* Root session side. */

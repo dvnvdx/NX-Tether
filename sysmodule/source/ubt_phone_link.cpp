@@ -17,6 +17,7 @@ namespace ams::ubt::link {
         constexpr size_t PageSize       = 0x1000;
         constexpr size_t CtrlBufferSize = 0x1000;
         constexpr size_t RxBufferSize   = 0x8000;
+        constexpr size_t MaxRxUrbs      = 4;
         constexpr size_t TxBufferSize   = 0x1000;
         constexpr size_t TxQueueSlots   = 128;
         constexpr size_t MaxInterfaces  = 24;
@@ -74,6 +75,7 @@ namespace ams::ubt::link {
             bool data_open;
             bool ep_in_open;
             bool ep_out_open;
+            size_t rx_urb_count;
             u8  ctrl_interface_number;
             u16 out_max_packet;
             u8  mac[6];
@@ -89,7 +91,7 @@ namespace ams::ubt::link {
         };
 
         alignas(PageSize) constinit u8 g_ctrl_buffer[CtrlBufferSize];
-        alignas(PageSize) constinit u8 g_rx_buffer[RxBufferSize];
+        alignas(PageSize) constinit u8 g_rx_buffers[MaxRxUrbs][RxBufferSize];
         alignas(PageSize) constinit u8 g_tx_buffer[TxBufferSize];
         constinit ::UsbHsInterface g_interfaces[MaxInterfaces];
         constinit ::UsbHsInterface g_data_interfaces[MaxInterfaces];
@@ -551,6 +553,9 @@ namespace ams::ubt::link {
                     break;
             }
 
+            /* Hand the whole batch to the console at once, so that it can be packed together. */
+            GetVirtualAdapter().FlushFrames();
+
             if (bad != 0) {
                 g_rx_dropped.fetch_add(bad);
                 if (g_logged_rx_parse_errors < 4) {
@@ -725,6 +730,13 @@ namespace ams::ubt::link {
         /* Link lifetime                                                                   */
         /* ------------------------------------------------------------------------------- */
 
+        /* Number of receive transfers kept queued with the phone. With only one, the phone has */
+        /* to wait after every transfer until the next one has been set up, which limits the    */
+        /* receive rate to a few MB/s.                                                          */
+        size_t GetRxUrbCount() {
+            return std::clamp<size_t>(config::Get().rx_urbs, 1, MaxRxUrbs);
+        }
+
         void TearDown(LinkContext &ctx) {
             g_link_up = false;
             GetVirtualAdapter().Detach();
@@ -785,7 +797,14 @@ namespace ams::ubt::link {
 
             ::usb_endpoint_descriptor in_copy = *in_desc;
             ::usb_endpoint_descriptor out_copy = *out_desc;
-            R_TRY(usbHsIfOpenUsbEp(std::addressof(ctx.data_if), std::addressof(ctx.ep_in), 1, RxBufferSize, std::addressof(in_copy)));
+            ctx.rx_urb_count = GetRxUrbCount();
+            if (const Result rc = usbHsIfOpenUsbEp(std::addressof(ctx.data_if), std::addressof(ctx.ep_in), static_cast<u16>(ctx.rx_urb_count), RxBufferSize, std::addressof(in_copy)); R_FAILED(rc)) {
+                R_UNLESS(ctx.rx_urb_count > 1, rc);
+                UBT_LOG_E("link: opening the receive endpoint for %zu transfers failed (0x%x); using one", ctx.rx_urb_count, rc.GetValue());
+                ctx.rx_urb_count = 1;
+                in_copy = *in_desc;
+                R_TRY(usbHsIfOpenUsbEp(std::addressof(ctx.data_if), std::addressof(ctx.ep_in), 1, RxBufferSize, std::addressof(in_copy)));
+            }
             ctx.ep_in_open = true;
             R_TRY(usbHsIfOpenUsbEp(std::addressof(ctx.data_if), std::addressof(ctx.ep_out), 1, TxBufferSize, std::addressof(out_copy)));
             ctx.ep_out_open = true;
@@ -854,17 +873,30 @@ namespace ams::ubt::link {
             s64 last_periodic_ms = 0;
             const char *reason = "stopped";
 
-            while (true) {
+            const auto PostReceive = [&](size_t index) -> Result {
                 u32 xfer_id = 0;
-                if (const Result rc = usbHsEpPostBufferAsync(std::addressof(ctx.ep_in), g_rx_buffer, RxBufferSize, 0, std::addressof(xfer_id)); R_FAILED(rc)) {
+                R_RETURN(usbHsEpPostBufferAsync(std::addressof(ctx.ep_in), g_rx_buffers[index], RxBufferSize, index, std::addressof(xfer_id)));
+            };
+
+            /* Queue the receive transfers. */
+            size_t urb_count = ctx.rx_urb_count;
+            for (size_t i = 0; i < urb_count; ++i) {
+                if (const Result rc = PostReceive(i); R_FAILED(rc)) {
                     SetLastError(rc);
-                    UBT_LOG_E("link: cannot queue a receive transfer: 0x%x", rc.GetValue());
-                    reason = "receive failed";
+                    UBT_LOG_E("link: cannot queue receive transfer %zu of %zu: 0x%x", i + 1, urb_count, rc.GetValue());
+                    urb_count = i;
                     break;
                 }
+            }
+            UBT_LOG_I("link: %zu receive transfer(s) queued", urb_count);
 
+            bool stop = (urb_count == 0);
+            if (stop) {
+                reason = "receive failed";
+            }
+
+            while (!stop) {
                 /* Wait for data, waking up regularly for housekeeping. */
-                bool stop = false;
                 while (true) {
                     if (R_SUCCEEDED(eventWait(std::addressof(ctx.ep_in.eventXfer), 200 * MsToNs))) {
                         break;
@@ -880,30 +912,52 @@ namespace ams::ubt::link {
                 }
                 eventClear(std::addressof(ctx.ep_in.eventXfer));
 
-                ::UsbHsXferReport report = {};
+                /* Reports come back in the order the transfers finished. */
+                ::UsbHsXferReport reports[MaxRxUrbs] = {};
                 u32 count = 0;
-                Result rc = usbHsEpGetXferReport(std::addressof(ctx.ep_in), std::addressof(report), 1, std::addressof(count));
-                if (R_SUCCEEDED(rc) && count >= 1) {
-                    rc = report.res;
-                } else if (R_SUCCEEDED(rc)) {
-                    rc = ResultLinkBadData;
+                if (const Result rc = usbHsEpGetXferReport(std::addressof(ctx.ep_in), reports, static_cast<u32>(urb_count), std::addressof(count)); R_FAILED(rc)) {
+                    SetLastError(rc);
+                    UBT_LOG_E("link: cannot read receive reports: 0x%x", rc.GetValue());
+                    reason = "receive failed";
+                    break;
                 }
 
-                if (R_FAILED(rc)) {
-                    SetLastError(rc);
-                    if (++consecutive_errors <= 3) {
-                        UBT_LOG_E("link: receive error 0x%x", rc.GetValue());
-                    }
-                    if (consecutive_errors >= 8 || IsDeviceGone(ctx)) {
-                        reason = "receive errors";
+                for (u32 i = 0; i < count && !stop; ++i) {
+                    const ::UsbHsXferReport &report = reports[i];
+                    const size_t index = static_cast<size_t>(report.id);
+                    if (index >= urb_count) {
+                        UBT_LOG_E("link: receive report for unknown transfer %llu", static_cast<unsigned long long>(report.id));
+                        reason = "receive failed";
+                        stop = true;
                         break;
                     }
-                    os::SleepThread(TimeSpan::FromMilliSeconds(20));
-                    continue;
-                }
-                consecutive_errors = 0;
 
-                ProcessReceivedTransfer(ctx, g_rx_buffer, std::min<size_t>(report.transferredSize, RxBufferSize));
+                    if (const Result rc = report.res; R_FAILED(rc)) {
+                        SetLastError(rc);
+                        if (++consecutive_errors <= 3) {
+                            UBT_LOG_E("link: receive error 0x%x", rc.GetValue());
+                        }
+                        if (consecutive_errors >= 8 || IsDeviceGone(ctx)) {
+                            reason = "receive errors";
+                            stop = true;
+                            break;
+                        }
+                        os::SleepThread(TimeSpan::FromMilliSeconds(20));
+                    } else {
+                        consecutive_errors = 0;
+                        ProcessReceivedTransfer(ctx, g_rx_buffers[index], std::min<size_t>(report.transferredSize, RxBufferSize));
+                    }
+
+                    if (const Result rc = PostReceive(index); R_FAILED(rc)) {
+                        SetLastError(rc);
+                        UBT_LOG_E("link: cannot queue a receive transfer: 0x%x", rc.GetValue());
+                        reason = "receive failed";
+                        stop = true;
+                    }
+                }
+                if (stop) {
+                    break;
+                }
 
                 if (NowMs() - last_periodic_ms >= 200) {
                     if (g_relink_requested.exchange(false)) { reason = "relink requested"; break; }

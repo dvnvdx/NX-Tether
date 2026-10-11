@@ -5,7 +5,7 @@
 # (switchbrew/libnx commit feebd02 or later). See README.md.
 
 TID     := 4200000000000E7B
-VERSION := 0.1.5
+VERSION := 0.1.6
 SYSMODULE_NSP := sysmodule/out/nintendo_nx_arm64_armv8a/release/sysmodule.nsp
 
 .PHONY: all sysmodule overlay dist test clean
